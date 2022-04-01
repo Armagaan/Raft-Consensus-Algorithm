@@ -1,0 +1,361 @@
+from distutils import cmd
+import signal
+import time
+import socket
+import random
+import threading
+import time
+import pickle
+import types
+from msg import decode_client_msg
+
+#MACROS
+FOLLOWER = 2
+CANDIDATE = 1
+LEADER = 0
+MIN_TIMEOUT = 6
+MAX_TIMEOUT = 10
+HEARTBEAT_INTERVAL = 1
+INVALID_THREAD = None
+INVALID_ADDR = (-1,-1)
+START_OF_TIME = 0
+HEADER_LEN = 1024
+
+#commands
+HB_CMD = b'HB'
+VR_CMD = b'VR'
+VG_CMD = b'VG'
+APP_CMD = b'AP'
+ACK_CMD = b'AK'
+
+#server class
+class Server:
+
+	def __init__(self, ip, port, other_server, term_num, state = 2):
+
+		#the meta data needed
+		self.ip = ip
+		self.port = port
+		self.leader_addr = INVALID_ADDR
+		#self.leader_conn = None
+		self.term = term_num
+		self.election_timeout = random.randint(MIN_TIMEOUT, MAX_TIMEOUT)
+		self.last_heartbeat = START_OF_TIME
+
+		#this is (ip,port) list
+		self.other_server = other_server
+
+		#no connections
+		self.connected = []
+		for i in range(len(other_server)):
+			self.connected.append(False)
+
+		#the sever state
+		self.state = state
+		if(state > 2 or state < 0):
+			self.state = 2
+
+		#the thread numbers running in this server
+		self.thread_listen = INVALID_THREAD
+		self.thread_write = INVALID_THREAD
+
+		#its time to connect
+		#self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+		self.socket.bind((self.ip, self.port))
+
+		# creatae a log table
+		self.log = []
+
+		#votes recived till now
+		self.votes_recived = 0
+		self.voted = None
+
+		self.commitIndex = 0
+		self.lastApplied = 0
+		self.nextIndices = [0]*len(self.other_server)
+		self.data_heartbeat = types.SimpleNamespace(
+			cmd = HB_CMD,
+			term = self.term,
+			)
+		self.data_append = types.SimpleNamespace(
+			cmd = "",
+			term = self.term,
+			leaderId = self.ip,
+			prevLogIndex = len(self.log) -1, 
+			prevLogTerm = 0, 
+			entries = [],
+			leaderCommit = self.commitIndex
+			)
+		self.data_ack = types.SimpleNamespace(
+			cmd = "",
+			term = self.term,
+			status = False
+		)
+		self.data_vote = types.SimpleNamespace(
+			cmd = VR_CMD,
+			term = self.term
+		)
+		
+	# encoding heartbeat message
+	def encode_heartbeat_msg(self):
+		data_encode = self.data_heartbeat(
+			cmd = HB_CMD,
+			term = self.term
+			# should we send leaderID
+		)
+		encoded_msg = pickle.dumps(data_encode)
+		return encoded_msg
+
+	# encoding append message
+	def encode_append_msg(self, data):
+		data_encode = self.data_append(
+			cmd = APP_CMD,
+			term = self.term,
+			leaderId = self.ip,
+			prevLogIndex = len(self.log) -1,
+			prevLogTerm = self.log[-1][0],
+			entries = [data],
+			leaderCommit = self.commitIndex
+		)
+		encoded_msg = pickle.dumps(data_encode)
+		return encoded_msg
+
+	# encoding voting messages
+	def encode_ack_msg(self, term, status):
+		data_encode = self.data_ack(
+			cmd = ACK_CMD,
+			term = self.term,
+			status = status
+			# should we send leaderID
+		)
+		encoded_msg = pickle.dumps(data_encode)
+		return encoded_msg
+
+
+	# encoding voting messages
+	def encode_vote_msg(self, vote_cmd):
+		data_encode = self.data_vote(
+			cmd = vote_cmd,
+			term = self.term
+			# should we send leaderID
+		)
+		encoded_msg = pickle.dumps(data_encode)
+		return encoded_msg
+
+	# decoding append message
+	def decode_msg(self, encoded_msg):
+		return pickle.loads(encoded_msg)
+
+
+	def append_RPC(self, data):
+
+		self.log.append((self.term, data))
+
+		try:
+			# encoding the append request
+			encoded_msg = self.encode_append_msg(data)
+
+			#send the append to each server
+			for server in self.other_server:
+				self.socket.sendto(encoded_msg, server)
+				print(f"[ APRC SENT ] to {server} at {time.time()}")
+
+		except Exception as e:
+			print(f"[ APPEND REQUEST ] failed")
+
+		acks = 0
+		required_acks = len(self.other_server)/2
+
+		while acks < required_acks:
+			# receive the acks
+			print("Not Implemented")
+
+
+	def receive_RPC(self, encoded_msg):
+		decoded_msg = self.decode_msg(encoded_msg)
+
+		# if the term of leader is less than current term then reject
+		if decoded_msg.term < self.term:
+			return self.term, False
+
+		# if no entry at prevLogIndex
+		elif len(self.log) <= decoded_msg.prevLogIndex:
+			return self.term, False
+		
+		# if term at prevLogIndex doesn't match then reject
+		elif self.log[decoded_msg.prevLogIndex][0] != decoded_msg.prevLogTerm:
+			# delete all the entries starting from prevLogIndex
+			self.log = self.log[:decoded_msg.prevLogIndex]
+			return self.term, False
+
+		else:
+			# append all the entries sent by leader
+			for entry in decoded_msg.entries:
+				self.log.append((decoded_msg.term, entry))
+
+			# if leaders commit index is more than followers commit index 
+			# then increase the followers commit index
+			if decoded_msg.leaderCommit > self.commitIndex:
+				self.commitIndex = min(decoded_msg.leaderCommit, len(self.log) -1)
+			return self.term, True
+
+	def _listen(self):
+
+		# Wait for the message to recive
+		#	1. EITHER IT WILL BE LEADER WITH DATA
+		#	2. IT WILL BE CANDIDATE ASKING FOR VOTE
+		# listen for heart beat message and thats it
+		while True:
+
+			#if you are follower read to heart beat message
+			if self.state == FOLLOWER:
+
+				msg = ''
+				#recive the message
+				try:
+					(msg,addr) = self.socket.recvfrom(HEADER_LEN)
+					#decode the message 
+					decoded_msg = self.decode_msg(msg)
+					cmd = decoded_msg.cmd
+
+					#if it is the heart beat then done
+					if(cmd == HB_CMD):
+						print(f"[ HEARTBEAT ] Recived at {time.time()}")
+						if(self.term <= payload):
+							self.last_heartbeat = time.time()
+							self.term = decoded_msg.term
+
+					#if recived the vote request
+					elif(cmd == VR_CMD):
+						
+						print(f"[ VOTE REQUEST ] Recived at {time.time()} from {addr} {self.term} {payload}")
+						term = payload
+
+						#see if you can vote or not?
+						#print(self.voted, self.term_num, term)
+						if(self.voted is None and self.term <= term):
+							self.voted = addr
+							encoded_msg = self.encode_vote_msg(VG_CMD)
+							self.socket.sendto(encoded_msg, addr)
+							print(f"[ VOTES SENT ]  to {addr} at {time.time()}")
+
+					elif cmd == APP_CMD:
+						term, status = self.receive_append(encoded_msg)
+						encoded_msg = self.encode_ack_msg(term, status)
+
+						try:
+							self.socket.sendto(encoded_msg, addr)
+							print(f"[ ACK SENT ] to {addr}")
+						except Exception as e:
+							print(f"[ ACK ] sending failed to {addr}")
+
+				except Exception as e:
+					print("[ HEARTBEAT ] cant connect to leader")
+
+			elif self.state == CANDIDATE:
+
+				msg = ''
+				#recive the message
+				try:
+					(msg,addr) = self.socket.recvfrom(HEADER_LEN)
+					#decode the message 
+					(cmd,payload) = self.decode_msg(msg)
+
+					if cmd == VG_CMD:
+						#add to votes
+						# print("i ma in right block")
+						self.votes_recived = self.votes_recived + 1
+						print(f"[ VOTES RECIVED ]  from {addr} at {time.time()} total votes: {self.votes_recived}")
+						if(self.votes_recived > len(self.other_server)/2):
+							self.state = LEADER
+
+				except Exception as e:
+					print("[ VOTE REQUEST ] cant connect to follower")
+
+			elif self.state == LEADER:
+				msg = ''
+
+				#recive the message
+				try:
+					(msg, addr) = self.socket.recvfrom(HEADER_LEN)
+					#decode the message 
+					data = decode_client_msg(msg)
+
+					self.append_RPC(data)
+				except Exception as e:
+					print("[ APPEND REQUEST ] not received")
+					
+				
+	# the write thread funtion
+	def _write(self):
+
+		# while true just send the heartbeat
+		while(True):
+
+			# see if you are leader
+			if(self.state == LEADER):
+
+				# get the meassage
+				header = self.encode_heartbeat_cmd()
+
+				#send the heartbeats to each server
+				for server in self.other_server:
+					self.socket.sendto(header, server)
+					print(f"[ HEARTBEAT SENT ] sent heartbeat to {server} at {time.time()}")
+
+				time.sleep(HEARTBEAT_INTERVAL)
+
+			#are you candidate?
+			elif(self.state == CANDIDATE):
+
+				#ask for votes
+				msg = self.encode_heartbeat_cmd()
+				
+				#for all server send the the vote request
+				for server in self.other_server:
+					try:
+						self.socket.sendto(msg,server)
+					except Exception as e:
+						print(f"[ VOTE REQUEST ] cant connect to {server}")
+						continue
+
+				#now wait till election timeout
+				time.sleep(self.election_timeout)
+
+
+	#create the run function
+	'''IF LEADER OR CANDIDATE THERE WILL BE TWO THREADS RUNNING FOR LISTENING AND READING
+		BUT IF FOLLOWE ONLY LISTEN THREAD WILL RUN'''
+	def run(self):
+
+		#set threads
+		self.thread_listen = threading.Thread(target = self._listen)
+		self.thread_listen.start()
+		self.thread_write = threading.Thread(target = self._write)
+		self.thread_write.start()
+
+		#add the timeout
+		print(f"[ SERVER STARTED ] timeout {self.election_timeout}")
+
+		#just run
+		while True:
+
+			# are you follower
+			if(self.state == FOLLOWER):
+
+				# just go to sleep
+				time.sleep(self.election_timeout)
+
+				# now check the last time you recived the heartbeat
+				if(time.time() - self.last_heartbeat > self.election_timeout):
+
+					# change the state and go for election
+					self.state = CANDIDATE
+					self.election_timeout = random.randint(MIN_TIMEOUT, MAX_TIMEOUT)
+					self.votes_recived = 1
+					self.voted = (self.ip, self.port)
+
+			#are you leader?
+			elif(self.state == LEADER):
+				continue
