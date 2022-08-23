@@ -1,5 +1,6 @@
-# Raft
-COL733: Implementing Raft
+# Raft Consensus Algorithm
+
+[Ongaro, Diego, and John Ousterhout. "In search of an understandable consensus algorithm." 2014 USENIX Annual Technical Conference (Usenix ATC 14). 2014.](https://raft.github.io/raft.pdf)
 
 ## NOTE
 - We have not implemented log compaction.
